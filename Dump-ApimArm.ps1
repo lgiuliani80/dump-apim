@@ -12,13 +12,15 @@
 .EXAMPLE
     .\Dump-ApimArm.ps1
     .\Dump-ApimArm.ps1 -OutputDirectory .\dump-test
+    .\Dump-ApimArm.ps1 -NoApis
 #>
 [CmdletBinding()]
 param(
-    [string]$SubscriptionId = '3005bdb8-47b7-4316-9277-a7a5e87f88e3',
-    [string]$ResourceGroupName = 'rg-openai',
-    [string]$ServiceName = 'apim-openailg',
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot ('apim-openailg-' + (Get-Date -Format 'yyyyMMdd-HHmmss')))
+    [string]$SubscriptionId,
+    [string]$ResourceGroupName,
+    [string]$ServiceName,
+    [string]$OutputDirectory,
+    [switch]$NoApis
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +37,18 @@ $fileExpressions = [ordered]@{}
 $unavailable = [System.Collections.Generic.List[string]]::new()
 $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $rules = @{}
+# Tipi gestiti da ApiOps (Supported Scenarios, 2022-09-01). Non si escludono
+# automaticamente i discendenti: alcuni, come releases e wikis, non sono coperti.
+$apiOpsTypes = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($type in @(
+    'apis', 'apis/diagnostics', 'apis/operations', 'apis/operations/policies',
+    'apis/policies', 'apis/resolvers', 'apis/resolvers/policies', 'apis/schemas',
+    'apis/tags', 'apiVersionSets', 'backends', 'diagnostics',
+    'gateways', 'gateways/apis', 'loggers', 'namedValues', 'policies',
+    'policyFragments', 'products', 'products/apis', 'products/apiLinks',
+    'products/groups', 'products/groupLinks', 'products/policies',
+    'products/tags', 'tags', 'tags/apiLinks', 'tags/productLinks'
+)) { $null = $apiOpsTypes.Add($type) }
 $previewVersions = @{
     'apis/tools'                       = '2025-09-01-preview'
     'clientApplications'               = '2025-09-01-preview'
@@ -49,6 +63,86 @@ foreach ($association in @(
     'workspaces/groups/users', 'workspaces/notifications/recipientEmails',
     'workspaces/notifications/recipientUsers'
 )) { $null = $nameOnlyTypes.Add($association) }
+
+# Percorsi read-only verificati con BCP073 e con la specifica APIM 2024-05-01.
+# Sono specifici del tipo: "status", per esempio, non e' read-only ovunque.
+$readOnlyPaths = @{
+    'service' = @(
+        'identity/principalId', 'identity/tenantId',
+        'properties/createdAtUtc', 'properties/developerPortalUrl',
+        'properties/gatewayRegionalUrl', 'properties/gatewayUrl',
+        'properties/managementApiUrl', 'properties/outboundPublicIPAddresses',
+        'properties/platformVersion', 'properties/portalUrl',
+        'properties/privateEndpointConnections/properties/groupIds',
+        'properties/privateEndpointConnections/properties/privateEndpoint/id',
+        'properties/privateEndpointConnections/properties/provisioningState',
+        'properties/privateIPAddresses', 'properties/provisioningState',
+        'properties/publicIPAddresses', 'properties/scmUrl',
+        'properties/targetProvisioningState'
+    )
+    'service/apis' = @('properties/isOnline', 'properties/provisioningState')
+    'service/apis/releases' = @('properties/createdDateTime', 'properties/updatedDateTime')
+    'service/apis/schemas' = @('properties/provisioningState')
+    'service/groups' = @('properties/builtIn')
+    'service/namedValues' = @('properties/keyVault/lastStatus', 'properties/provisioningState')
+    'service/notifications' = @('properties')
+    'service/policyFragments' = @('properties/provisioningState')
+    'service/portalRevisions' = @(
+        'properties/createdDateTime', 'properties/provisioningState',
+        'properties/status', 'properties/statusDetails', 'properties/updatedDateTime'
+    )
+    'service/privateEndpointConnections' = @(
+        'properties/groupIds', 'properties/privateEndpoint', 'properties/provisioningState'
+    )
+    'service/schemas' = @('properties/provisioningState')
+    'service/subscriptions' = @(
+        'properties/createdDate', 'properties/endDate', 'properties/expirationDate',
+        'properties/notificationDate', 'properties/startDate', 'properties/stateComment'
+    )
+    'service/templates' = @('properties/isDefault')
+    'service/users' = @('properties/groups', 'properties/registrationDate')
+    'service/workspaces/apis' = @('properties/isOnline', 'properties/provisioningState')
+    'service/workspaces/apis/releases' = @('properties/createdDateTime', 'properties/updatedDateTime')
+    'service/workspaces/apis/schemas' = @('properties/provisioningState')
+    'service/workspaces/namedValues' = @('properties/keyVault/lastStatus', 'properties/provisioningState')
+    'service/workspaces/policyFragments' = @('properties/provisioningState')
+    'service/workspaces/schemas' = @('properties/provisioningState')
+}
+$removedReadOnly = [ordered]@{}
+
+function Remove-ReadOnlyPath($node, [string[]]$parts) {
+    if ($node -is [array]) {
+        $count = 0
+        foreach ($item in $node) { $count += Remove-ReadOnlyPath $item $parts }
+        return $count
+    }
+    $key = $parts[0]
+    if ($node -is [System.Collections.IDictionary]) {
+        if (-not $node.Contains($key)) { return 0 }
+        if ($parts.Count -eq 1) {
+            $node.Remove($key)
+            return 1
+        }
+        return Remove-ReadOnlyPath $node[$key] $parts[1..($parts.Count - 1)]
+    }
+    if ($null -eq $node -or $null -eq $node.PSObject.Properties[$key]) { return 0 }
+    if ($parts.Count -eq 1) {
+        $node.PSObject.Properties.Remove($key)
+        return 1
+    }
+    return Remove-ReadOnlyPath $node.$key $parts[1..($parts.Count - 1)]
+}
+
+function Remove-ReadOnlyProperties {
+    foreach ($resource in $resources) {
+        $type = $resource.type.Replace('Microsoft.ApiManagement/', '')
+        if (-not $readOnlyPaths.ContainsKey($type)) { continue }
+        foreach ($path in $readOnlyPaths[$type]) {
+            $count = Remove-ReadOnlyPath $resource ($path -split '/')
+            if ($count) { $removedReadOnly["$type/$path"] = $count + [int]$removedReadOnly["$type/$path"] }
+        }
+    }
+}
 
 function Add-Children([string]$parentType, [string[]]$collections) {
     $rules[$parentType] = $collections
@@ -228,18 +322,21 @@ function Visit-Children([string]$parentPath, [string]$parentType) {
     foreach ($collection in $rules[$parentType]) {
         $typePath = if ($parentType) { "$parentType/$collection" } else { $collection }
         $collectionPath = if ($parentPath) { "$parentPath/$collection" } else { $collection }
+        if ($NoApis -and $apiOpsTypes.Contains($typePath) -and -not $rules.ContainsKey($typePath)) { continue }
         $version = if ($previewVersions.ContainsKey($typePath)) { $previewVersions[$typePath] } else { $apiVersion }
         $items = @(Get-Collection $collectionPath $version)
         foreach ($item in $items) {
             if (-not $item.name) { throw "Risorsa priva di name in $collectionPath" }
             $relativeId = "$collectionPath/$([uri]::EscapeDataString($item.name))"
-            $detail = if ($nameOnlyTypes.Contains($typePath)) {
-                $item
+            if (-not ($NoApis -and $apiOpsTypes.Contains($typePath))) {
+                $detail = if ($nameOnlyTypes.Contains($typePath)) {
+                    $item
+                }
+                else {
+                    Invoke-Arm "$armBase/$relativeId`?api-version=$version"
+                }
+                Add-Resource $detail $relativeId $typePath
             }
-            else {
-                Invoke-Arm "$armBase/$relativeId`?api-version=$version"
-            }
-            Add-Resource $detail $relativeId $typePath
             Visit-Children $relativeId $typePath
         }
         if ($items.Count) { Write-Host "$collectionPath : $($items.Count)" }
@@ -356,6 +453,7 @@ try {
     $target = [IO.Path]::GetFullPath($OutputDirectory)
     $null = New-Item -Path $target -ItemType Directory -Force
     $media = Export-PortalMedia (Join-Path $target 'portal-media')
+    Remove-ReadOnlyProperties
     $text = Export-PolicyAndHtml $target
     $template = [ordered]@{
         '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
@@ -380,6 +478,16 @@ try {
         & az bicep build --file $bicepFile --outfile $compiled --only-show-errors
         if ($LASTEXITCODE -ne 0) { throw 'Compilazione Bicep non riuscita.' }
         $compiledBytes = (Get-Item -LiteralPath $compiled).Length
+        $lint = (& az bicep lint --file $bicepFile --diagnostics-format sarif 2>&1) -join "`n"
+        $lintExitCode = $LASTEXITCODE
+        $readOnlyLintWarnings = [regex]::Matches($lint, '"ruleId"\s*:\s*"BCP073"').Count
+        $otherLintWarnings = [regex]::Matches($lint, '"ruleId"\s*:\s*"BCP(?!073)\d+"').Count
+        if ($lintExitCode -ne 0) {
+            Write-Warning "Linter Bicep non riuscito (codice $lintExitCode). Verificare manualmente main.bicep."
+        }
+        if ($readOnlyLintWarnings) {
+            Write-Warning "Il Bicep contiene ancora $readOnlyLintWarnings proprieta read-only (BCP073). Aggiornare la mappa readOnlyPaths."
+        }
     }
     finally {
         foreach ($temporary in @($intermediate, $generated, $compiled)) {
@@ -389,7 +497,9 @@ try {
     $report = [ordered]@{
         resourceId = $serviceId
         apiVersion = $apiVersion
+        noApis = [bool]$NoApis
         armResourceCount = $resources.Count
+        removedReadOnlyProperties = $removedReadOnly
         portalMediaCount = $media.count
         chunkedMediaCount = $media.chunked
         portalMediaWithoutContentItem = $media.orphans
@@ -397,6 +507,9 @@ try {
         extractedHtml = $text.html
         compiledArmBytes = $compiledBytes
         fitsSingleArmDeployment = ($compiledBytes -le 4MB)
+        bicepLintExitCode = $lintExitCode
+        readOnlyBicepWarnings = $readOnlyLintWarnings
+        otherBicepWarnings = $otherLintWarnings
         unavailableCollections = @($unavailable | Sort-Object -Unique)
         coverage = $(if ($unavailable.Count) {
             'Non verificabile per le collection HTTP 404 elencate (possono essere vuote o non supportate).'
