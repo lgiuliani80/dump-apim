@@ -9,10 +9,6 @@
     L'output puo' contenere dati riservati. I segreti che Azure non restituisce non
     possono essere ricostruiti; il template e' uno snapshot, non una garanzia di
     redeploy senza modifiche (alcune proprieta' GET sono di sola lettura).
-.EXAMPLE
-    .\Dump-ApimArm.ps1
-    .\Dump-ApimArm.ps1 -OutputDirectory .\dump-test
-    .\Dump-ApimArm.ps1 -NoApis
 #>
 [CmdletBinding()]
 param(
