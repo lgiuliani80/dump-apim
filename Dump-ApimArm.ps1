@@ -4,8 +4,8 @@
     Esporta uno snapshot Bicep di un'istanza APIM e i media del Developer Portal.
 .DESCRIPTION
     Enumera le risorse ARM APIM (incluse quelle annidate), segue nextLink e salva
-    un sorgente Bicep con il nome APIM parametrizzato. I file HTML, XML e binari
-    sono referenziati con le funzioni loadTextContent/loadFileAsBase64.
+    un sorgente Bicep con il nome APIM parametrizzato. HTML e XML usano
+    loadTextContent; le URL dei media sono lette da un dizionario JSON.
     L'output puo' contenere dati riservati. I segreti che Azure non restituisce non
     possono essere ricostruiti; il template e' uno snapshot, non una garanzia di
     redeploy senza modifiche (alcune proprieta' GET sono di sola lettura).
@@ -34,10 +34,11 @@ $headers = @{ Authorization = "Bearer $token" }
 $resources = [System.Collections.Generic.List[object]]::new()
 $fileExpressions = [ordered]@{}
 $unavailable = [System.Collections.Generic.List[string]]::new()
+$armRequests = [System.Collections.Generic.List[object]]::new()
 $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $rules = @{}
-# Tipi gestiti da ApiOps (Supported Scenarios, 2022-09-01). Non si escludono
-# automaticamente i discendenti: alcuni, come releases e wikis, non sono coperti.
+# Tipi gestiti da ApiOps (Supported Scenarios, 2022-09-01).
+# Le esclusioni saltano tutto il ramo, senza enumerare i genitori.
 $apiOpsTypes = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($type in @(
     'apis', 'apis/diagnostics', 'apis/operations', 'apis/operations/policies',
@@ -86,10 +87,6 @@ $readOnlyPaths = @{
     'service/namedValues' = @('properties/keyVault/lastStatus', 'properties/provisioningState')
     'service/notifications' = @('properties')
     'service/policyFragments' = @('properties/provisioningState')
-    'service/portalRevisions' = @(
-        'properties/createdDateTime', 'properties/provisioningState',
-        'properties/status', 'properties/statusDetails', 'properties/updatedDateTime'
-    )
     'service/privateEndpointConnections' = @(
         'properties/groupIds', 'properties/privateEndpoint', 'properties/provisioningState'
     )
@@ -183,6 +180,19 @@ function Set-ServiceNameParameter {
     }
 }
 
+function Set-IdentityProviderSecretParameters {
+    $required = [System.Collections.Generic.List[string]]::new()
+    foreach ($resource in $resources) {
+        if ($resource.type -ne 'Microsoft.ApiManagement/service/identityProviders' -or
+            $resource.properties.clientSecret -or $resource.properties.certificateId) { continue }
+        $name = $resource.name.Split('/')[-1]
+        $escaped = $name.Replace("'", "''")
+        $resource.properties | Add-Member -NotePropertyName clientSecret -NotePropertyValue "[parameters('identityProviderClientSecrets')['$escaped']]" -Force
+        $required.Add($name)
+    }
+    return $required.ToArray()
+}
+
 function Remove-ReadOnlyPath($node, [string[]]$parts) {
     if ($node -is [array]) {
         $count = 0
@@ -230,7 +240,7 @@ Add-Children '' @(
     'groups', 'identityProviders',
     'loggers', 'namedValues', 'notifications', 'openidConnectProviders',
     'policies', 'policyFragments', 'policyRestrictions', 'portalconfigs',
-    'portalRevisions', 'portalsettings', 'privateEndpointConnections',
+    'portalsettings', 'privateEndpointConnections',
     'products', 'schemas', 'subscriptions', 'tags', 'tenant', 'users',
     'workspaces', 'workspaceLinks'
 )
@@ -262,9 +272,35 @@ Add-Children 'workspaces/notifications' @('recipientEmails', 'recipientUsers')
 Add-Children 'workspaces/products' @('apiLinks', 'groupLinks', 'policies')
 Add-Children 'workspaces/tags' @('apiLinks', 'operationLinks', 'productLinks')
 
+function Test-ExcludedType([string]$typePath) {
+    $parts = $typePath -split '/'
+    if ('portalRevisions' -in $parts) { return $true }
+    if ($NoSubscriptions -and 'subscriptions' -in $parts) { return $true }
+    if ($NoUsersGroups -and @($parts | Where-Object { $_ -in @('users', 'groups', 'groupLinks', 'recipientUsers') }).Count) { return $true }
+    if ($NoApis) {
+        $normalized = $typePath -replace '^workspaces/', ''
+        foreach ($type in $apiOpsTypes) {
+            if ($normalized -ieq $type -or $normalized.StartsWith("$type/", [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    }
+    return $false
+}
+
 function Invoke-Arm([string]$uri, [string]$method = 'GET', [switch]$AllowNotFound) {
+    $endpoint = [uri]$uri
+    $path = $endpoint.AbsolutePath
+    if ($endpoint.Scheme -ne 'https' -or $endpoint.Host -ine ([uri]$armBase).Host -or
+        -not $path.StartsWith($serviceId, [StringComparison]::OrdinalIgnoreCase) -or
+        ($path.Length -gt $serviceId.Length -and $path[$serviceId.Length] -ne '/')) {
+        throw 'Endpoint ARM esterno al servizio APIM richiesto.'
+    }
+    $relativePath = $path.Substring($serviceId.Length).TrimStart('/')
+    $segments = $relativePath -split '/'
+    $typeParts = for ($i = 0; $i -lt $segments.Count; $i += 2) { $segments[$i] }
+    if (Test-ExcludedType ($typeParts -join '/')) { throw "Endpoint ARM escluso dai flag: $relativePath" }
     for ($attempt = 0; $attempt -lt 5; $attempt++) {
         try {
+            $armRequests.Add([ordered]@{ method = $method; path = $relativePath })
             return Invoke-RestMethod -Uri $uri -Headers $headers -Method $method
         }
         catch {
@@ -396,23 +432,19 @@ function Visit-Children([string]$parentPath, [string]$parentType) {
     foreach ($collection in $rules[$parentType]) {
         $typePath = if ($parentType) { "$parentType/$collection" } else { $collection }
         $collectionPath = if ($parentPath) { "$parentPath/$collection" } else { $collection }
-        if ($NoSubscriptions -and $collection -eq 'subscriptions') { continue }
-        if ($NoUsersGroups -and $collection -in @('users', 'groups', 'groupLinks', 'recipientUsers')) { continue }
-        if ($NoApis -and $apiOpsTypes.Contains($typePath) -and -not $rules.ContainsKey($typePath)) { continue }
+        if (Test-ExcludedType $typePath) { continue }
         $version = if ($previewVersions.ContainsKey($typePath)) { $previewVersions[$typePath] } else { $apiVersion }
         $items = @(Get-Collection $collectionPath $version)
         foreach ($item in $items) {
             if (-not $item.name) { throw "Risorsa priva di name in $collectionPath" }
             $relativeId = "$collectionPath/$([uri]::EscapeDataString($item.name))"
-            if (-not ($NoApis -and $apiOpsTypes.Contains($typePath))) {
-                $detail = if ($nameOnlyTypes.Contains($typePath)) {
-                    $item
-                }
-                else {
-                    Invoke-Arm "$armBase/$relativeId`?api-version=$version"
-                }
-                Add-Resource $detail $relativeId $typePath
+            $detail = if ($nameOnlyTypes.Contains($typePath)) {
+                $item
             }
+            else {
+                Invoke-Arm "$armBase/$relativeId`?api-version=$version"
+            }
+            Add-Resource $detail $relativeId $typePath
             Visit-Children $relativeId $typePath
         }
         if ($items.Count) { Write-Host "$collectionPath : $($items.Count)" }
@@ -435,15 +467,16 @@ function Export-PortalMedia([string]$destination) {
         }
         $byBlobId[$id] = @{ resource = $item; filename = $filename; downloaded = $false }
     }
-    $secrets = Invoke-Arm "$armBase/portalSettings/mediaContent/listSecrets?api-version=$apiVersion" -method POST
+    $secrets = Invoke-Arm "$armBase/portalconfigs/default/listMediaContentSecrets?api-version=2021-08-01" -method POST
     if (-not $secrets.containerSasUrl) { throw 'SAS dei media del Developer Portal assente.' }
     $sas = [uri]$secrets.containerSasUrl
     $root = $sas.GetLeftPart([UriPartial]::Path)
     $query = $sas.Query.TrimStart('?')
     $marker = ''
     $count = 0
-    $chunked = 0
     $orphans = [System.Collections.Generic.List[string]]::new()
+    $manifest = [System.Collections.Generic.List[object]]::new()
+    $urls = [ordered]@{}
     $null = New-Item -Path $destination -ItemType Directory -Force
     do {
         $listUri = "$root`?restype=container&comp=list&maxresults=5000&$query"
@@ -479,7 +512,12 @@ function Export-PortalMedia([string]$destination) {
             }
             $encoded = ($blob.Name.Split('/') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
             try { Invoke-WebRequest -Uri "$root/$encoded`?$query" -OutFile $filename | Out-Null }
-            catch { Write-Warning "Download media non riuscito: $($blob.Name) (verificare SAS e connettivita')." }
+            catch { throw "Download media non riuscito: $blobId (verificare SAS e connettivita')." }
+            $manifest.Add([ordered]@{
+                blobName = $blobId
+                fileName = $name
+                contentType = [string]$blob.Properties.'Content-Type'
+            })
             if ($entry) { $entry.downloaded = $true; $entry = $null }
             $count++
         }
@@ -493,34 +531,26 @@ function Export-PortalMedia([string]$destination) {
             $uri = [uri]$url
             if ($uri.Scheme -ne 'https') { Write-Warning "downloadUrl non HTTPS per media $id" }
             try { Invoke-WebRequest -Uri $uri -OutFile (Join-Path $destination $entry.filename) | Out-Null }
-            catch { Write-Warning "Download media non riuscito per $id (verificare il downloadUrl)."; continue }
+            catch { throw "Download media non riuscito per $id (verificare il downloadUrl)." }
             $entry.downloaded = $true
             $count++
+            $manifest.Add([ordered]@{
+                blobName = $id
+                fileName = $entry.filename
+                contentType = [string]$entry.resource.properties.contentType
+            })
         }
-        $file = Join-Path $destination $entry.filename
-        $parts = [System.Collections.Generic.List[string]]::new()
-        $bytes = [IO.File]::ReadAllBytes($file)
-        if ($bytes.Length -gt 92160) {
-            $chunked++
-            $partDir = Join-Path $destination "parts\$id"
-            $null = New-Item -Path $partDir -ItemType Directory -Force
-            for ($offset = 0; $offset -lt $bytes.Length; $offset += 92160) {
-                $size = [Math]::Min(92160, $bytes.Length - $offset)
-                $part = [byte[]]::new($size)
-                [array]::Copy($bytes, $offset, $part, 0, $size)
-                $partName = '{0:D4}.part' -f ($parts.Count + 1)
-                [IO.File]::WriteAllBytes((Join-Path $partDir $partName), $part)
-                $parts.Add("loadFileAsBase64($(Get-BicepPath "portal-media/parts/$id/$partName"))")
-            }
-        }
-        else {
-            $parts.Add("loadFileAsBase64($(Get-BicepPath "portal-media/$($entry.filename)"))")
-        }
-        $expression = if ($parts.Count -eq 1) { $parts[0] } else { "concat($($parts -join ', '))" }
-        $entry.resource.properties.PSObject.Properties.Remove('downloadUrl')
-        $entry.resource.properties | Add-Member -NotePropertyName data -NotePropertyValue (Set-FileExpression $expression) -Force
+        $encodedId = [uri]::EscapeDataString($id)
+        $urls[$id] = "$root/$encodedId"
+        $key = $id.Replace('\', '\\').Replace("'", "\'").Replace('${', '\${')
+        $entry.resource.properties.PSObject.Properties.Remove('data')
+        $entry.resource.properties | Add-Member -NotePropertyName downloadUrl -NotePropertyValue (Set-FileExpression "portalMediaUrls['$key']") -Force
     }
-    return @{ count = $count; orphans = $orphans.ToArray(); chunked = $chunked }
+    $target = Split-Path $destination -Parent
+    [IO.File]::WriteAllText((Join-Path $target 'portal-media-urls.json'), (ConvertTo-Json -InputObject $urls -Depth 10), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $target 'portal-media-manifest.json'), (ConvertTo-Json -InputObject $manifest.ToArray() -Depth 10), [Text.UTF8Encoding]::new($false))
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Upload-PortalMedia.ps1') -Destination (Join-Path $target 'Upload-PortalMedia.ps1') -Force
+    return @{ count = $count; orphans = $orphans.ToArray(); referenced = $urls.Count }
 }
 
 try {
@@ -539,6 +569,7 @@ try {
     Remove-ExistingProperties
     Remove-ReadOnlyProperties
     $text = Export-PolicyAndHtml $target
+    $identityProviderSecrets = @(Set-IdentityProviderSecretParameters)
     Set-ServiceNameParameter
     $template = [ordered]@{
         '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
@@ -547,6 +578,10 @@ try {
             serviceName = @{ type = 'string'; defaultValue = $ServiceName }
         }
         resources      = $resources.ToArray()
+    }
+    if ($identityProviderSecrets.Count) {
+        $template.parameters.identityProviderClientSecrets = @{ type = 'secureObject' }
+        Write-Warning "Fornire il parametro sicuro identityProviderClientSecrets per: $($identityProviderSecrets -join ', ')."
     }
     $intermediate = Join-Path $target '_apim-intermediate.json'
     $generated = Join-Path $target '_apim-intermediate.bicep'
@@ -561,6 +596,7 @@ try {
             if ($source.IndexOf($literal, [StringComparison]::Ordinal) -lt 0) { throw "Riferimento Bicep non trovato: $marker" }
             $source = $source.Replace($literal, $fileExpressions[$marker])
         }
+        if ($media.referenced) { $source = "var portalMediaUrls = loadJsonContent('./portal-media-urls.json')`n`n" + $source }
         $bicepFile = Join-Path $target 'main.bicep'
         [IO.File]::WriteAllText($bicepFile, $source, [Text.UTF8Encoding]::new($false))
         & az bicep build --file $bicepFile --outfile $compiled --only-show-errors
@@ -589,10 +625,11 @@ try {
         noSubscriptions = [bool]$NoSubscriptions
         noUsersGroups = [bool]$NoUsersGroups
         asExisting = [bool]$AsExisting
+        requiredIdentityProviderClientSecrets = $identityProviderSecrets
+        armRequests = $armRequests.ToArray()
         armResourceCount = $resources.Count
         removedReadOnlyProperties = $removedReadOnly
         portalMediaCount = $media.count
-        chunkedMediaCount = $media.chunked
         portalMediaWithoutContentItem = $media.orphans
         extractedPolicies = $text.policies
         extractedHtml = $text.html
@@ -611,7 +648,7 @@ try {
             'I segreti non restituiti da ARM (password, chiavi, valori segreti) non sono recuperabili dallo snapshot.'
             'I media del Developer Portal sono blob separati; non sono risorse del template ARM.'
             'Il sorgente Bicep contiene anche proprieta di sola lettura: verificarlo prima del redeploy.'
-            'La compilazione Bicep incorpora i media: il template ARM risultante puo superare il limite ARM di 4 MB.'
+            'Eseguire Upload-PortalMedia.ps1 sulla destinazione e ricompilare il Bicep prima del deployment dei content item.'
         )
     }
     [IO.File]::WriteAllText((Join-Path $target 'report.json'), (ConvertTo-Json -InputObject $report -Depth 10), [Text.UTF8Encoding]::new($false))

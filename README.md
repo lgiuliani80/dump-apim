@@ -3,7 +3,11 @@
 `Dump-ApimArm.ps1` usa PowerShell 7 e Azure CLI (`az login`) per leggere l'istanza
 `apim-openailg` nel gruppo `rg-openai`. Richiede accesso in lettura alle risorse APIM
 e accesso ai contenuti del Developer Portal. Esegue solo letture, salvo la richiesta
-POST `listSecrets` necessaria per ottenere l'URL temporaneo dei media.
+POST `portalconfigs/default/listMediaContentSecrets?api-version=2021-08-01`
+necessaria per ottenere l'URL temporaneo dei media. Lo script di upload generato
+scrive invece nello storage del servizio APIM di destinazione.
+Mantenere `Upload-PortalMedia.ps1` accanto allo script di dump: viene copiato
+nella cartella di output per rendere il risultato autonomo.
 
 ```powershell
 .\Dump-ApimArm.ps1
@@ -51,10 +55,14 @@ per eseguire lo script. `report.json` registra `noSubscriptions`,
 API (incluse operazioni, policy, diagnostica, version set e GraphQL), backend,
 policy globali e frammenti, named value, logger, diagnostica, gateway e loro
 associazioni API, prodotti e relative associazioni API/gruppi, policy e tag.
-L'istanza APIM, il Developer Portal e le sottorisorse non elencate da ApiOps
-(per esempio release, wiki, utenti, workspace e configurazioni gateway)
-rimangono nel dump. Lo script attraversa anche i genitori esclusi per
-raggiungere eventuali discendenti non coperti; `report.json` indica `noApis`.
+Le stesse esclusioni si applicano nei workspace. I rami esclusi vengono saltati
+prima di qualunque richiesta, incluse enumerazione delle collection e lettura
+dei discendenti (quindi anche release, wiki e configurazioni dei gateway esclusi).
+L'istanza APIM, il Developer Portal, i workspace e gli altri rami non esclusi
+rimangono nel dump. `report.json` indica i flag attivi e `armRequests` elenca
+metodo e percorso relativo di ogni richiesta ARM effettuata, senza token o SAS.
+Un controllo centralizzato blocca anche eventuali `nextLink` verso tipi esclusi
+o percorsi esterni al servizio.
 
 Le proprieta' read-only restituite dalle API sono eliminate **per tipo e
 percorso** prima della generazione del Bicep (incluse le proprieta' annidate
@@ -70,30 +78,74 @@ e non vengono eliminati automaticamente.
 
 Il risultato e' una cartella `apim-openailg-<timestamp>` con `main.bicep`
 (sorgente Bicep con parametro `serviceName`),
-`portal-media\` (blob binari del Developer Portal), `html\`, `policies\` e `report.json`
+`portal-media\` (blob binari del Developer Portal), `html\`, `policies\`, `report.json`,
+`Upload-PortalMedia.ps1`, `portal-media-manifest.json` e `portal-media-urls.json`
 (conteggi ed eventuali collection che rispondono 404). Lo script enumera le
 collection di risorse APIM annidate, incluse API, revisioni come API, operazioni,
 policy, prodotti, workspace, content type e content item del Developer Portal.
 Usa l'API `2024-05-01` e le versioni preview per i tipi introdotti successivamente;
 segue tutte le pagine `nextLink`. I media sono salvati separatamente perche'
-non sono risorse ARM. I content item binari non conservano `downloadUrl`: hanno
-`data: loadFileAsBase64('./portal-media/<fileName>')`. Nei nomi locali dei media
+non sono risorse ARM. I content item binari conservano `downloadUrl`, letto dal
+dizionario `portal-media-urls.json` mediante `loadJsonContent()` nel Bicep;
+non contengono `data` o contenuti Base64. Nei nomi locali dei media
 e dei blob orfani, `/` viene sostituito con `_`, senza modificare i metadati
 originali o gli URL di download. Le omonimie di `fileName`
 sono disambiguate con `_<blobId>` prima dell'estensione; per i blob orfani
-si usa un suffisso numerico, evitando sovrascritture. I file oltre 90 KiB
-sono anche suddivisi in `portal-media\parts\<blobId>\` per rispettare il limite
-di 96 KiB di `loadFileAsBase64`: il campo `data` usa `concat` delle parti, mentre
-il file originale rimane disponibile. I contenuti HTML e le policy XML sono
+si usa un suffisso numerico, evitando sovrascritture. I file restano interi:
+non sono suddivisi in chunk ne' incorporati nel template. Il manifest conserva
+la corrispondenza fra file locale, nome blob originale e MIME type.
+I contenuti HTML e le policy XML sono
 estratti come `.html`/`.xml` e richiamati con `loadTextContent()`.
 
 Il sorgente Bicep viene compilato localmente dallo script per validarlo, ma non
-viene conservato un template ARM JSON. `loadTextContent()` e `loadFileAsBase64()`
-sono funzioni Bicep valutate in compilazione, non funzioni ARM JSON. Con media
-di grandi dimensioni il template ARM compilato puo' superare il limite ARM di
-4 MiB e non essere distribuibile come singolo deployment. `report.json` include
-`compiledArmBytes`, `fitsSingleArmDeployment`, il numero di file suddivisi e
+viene conservato un template ARM JSON. `loadTextContent()` e `loadJsonContent()`
+sono valutate in compilazione, non a deployment. I binari non contribuiscono
+alla dimensione del template ARM; le altre risorse possono comunque superare
+il limite ARM di 4 MiB. `report.json` include
+`compiledArmBytes`, `fitsSingleArmDeployment` e
 gli eventuali blob orfani privi di un content item da cui ricavare `fileName`.
+
+## Upload dei media prima del deployment
+
+L'istanza APIM di destinazione deve gia' esistere: se il Bicep deve crearla,
+provisionarla prima di eseguire l'upload. Dopo `az login`, dalla cartella di
+output eseguire:
+
+```powershell
+.\Upload-PortalMedia.ps1 -SubscriptionId <id-destinazione> -ResourceGroupName <gruppo-destinazione> -ServiceName <nome-destinazione>
+# Solo dopo l'upload, compilare o distribuire main.bicep:
+az deployment group create --subscription <id-destinazione> --resource-group <gruppo-destinazione> --template-file .\main.bicep --parameters serviceName=<nome-destinazione>
+```
+
+Lo script usa `az rest` per ottenere la SAS tramite
+`POST {serviceResourceId}/portalconfigs/default/listMediaContentSecrets?api-version=2021-08-01`
+e `az storage blob upload` per caricare tutti i file del manifest, inclusi
+i blob orfani, con nome blob e MIME type originali. `--overwrite true` permette
+di rieseguire l'upload. Non distribuisce risorse ARM e non pubblica il portale.
+
+Solo quando tutti gli upload riescono, aggiorna atomicamente il dizionario
+`portal-media-urls.json` (`blobId` -> URL blob di destinazione **senza SAS**).
+In caso di errore interrompe l'esecuzione senza aggiornare il JSON; i blob
+gia' caricati non vengono rimossi. Il dizionario iniziale contiene le URL dello
+storage sorgente. La SAS e' usata solo in memoria tramite la variabile ambiente
+`AZURE_STORAGE_SAS_TOKEN`, ripristinata al termine; non viene scritta nei file.
+I percorsi dei file sono relativi alla posizione dello script, non a `$PWD`.
+**Ricompilare sempre il Bicep dopo l'upload**: un template ARM compilato in
+precedenza conserva le vecchie URL. Usare lo stesso nome APIM per l'upload e
+per il parametro `serviceName`.
+
+Le `PortalRevision` sono sempre ignorate: lo script non ne legge gli endpoint
+e non le include nel Bicep. Il dump non ricrea lo storico delle pubblicazioni
+e non pubblica automaticamente il portale.
+
+Quando la GET di un identity provider non restituisce ne' `clientSecret` ne'
+`certificateId`, il Bicep richiede il parametro **secure object**
+`identityProviderClientSecrets`, con una chiave per ogni provider (es. `aad`).
+Il dump non legge automaticamente i segreti: emette un warning e li elenca in
+`report.json` come `requiredIdentityProviderClientSecrets`. Fornirli tramite
+un canale sicuro al deployment; non inserirli nel sorgente Bicep o in file
+versionati. Le credenziali leggibili tramite l'operazione ARM `listSecrets`
+possono essere recuperate separatamente con autorizzazioni adeguate.
 
 **Limitazioni:** un dump ARM non puo' recuperare segreti che il provider non
 restituisce; il sorgente rispecchia le risposte GET e puo' contenere proprieta'
@@ -116,3 +168,6 @@ la compatibilita' con `-NoApis`, le dichiarazioni `existing`, i riferimenti
 parametrizzati e l'estrazione HTML/XML compilando realmente il Bicep prodotto.
 Verificano anche percorsi di output relativi e assoluti con spazi, mantenendo
 diverse la directory PowerShell e quella del processo.
+I test includono media da 5 MiB senza chunking/Base64, nomi file duplicati,
+blob orfani, download di fallback, upload simulato, errore di upload parziale,
+ripristino della SAS e ricompilazione con le URL di destinazione.
