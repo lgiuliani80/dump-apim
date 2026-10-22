@@ -44,8 +44,11 @@ policy, prodotti, workspace, content type e content item del Developer Portal.
 Usa l'API `2024-05-01` e le versioni preview per i tipi introdotti successivamente;
 segue tutte le pagine `nextLink`. I media sono salvati separatamente perche'
 non sono risorse ARM. I content item binari non conservano `downloadUrl`: hanno
-`data: loadFileAsBase64('./portal-media/<fileName>')`. Le omonimie di `fileName`
-sono disambiguate con `_<blobId>` prima dell'estensione. I file oltre 90 KiB
+`data: loadFileAsBase64('./portal-media/<fileName>')`. Nei nomi locali dei media
+e dei blob orfani, `/` viene sostituito con `_`, senza modificare i metadati
+originali o gli URL di download. Le omonimie di `fileName`
+sono disambiguate con `_<blobId>` prima dell'estensione; per i blob orfani
+si usa un suffisso numerico, evitando sovrascritture. I file oltre 90 KiB
 sono anche suddivisi in `portal-media\parts\<blobId>\` per rispettare il limite
 di 96 KiB di `loadFileAsBase64`: il campo `data` usa `concat` delle parti, mentre
 il file originale rimane disponibile. I contenuti HTML e le policy XML sono

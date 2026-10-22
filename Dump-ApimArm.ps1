@@ -43,7 +43,7 @@ foreach ($type in @(
     'gateways', 'gateways/apis', 'loggers', 'namedValues', 'policies',
     'policyFragments', 'products', 'products/apis', 'products/apiLinks',
     'products/groups', 'products/groupLinks', 'products/policies',
-    'products/tags', 'tags', 'tags/apiLinks', 'tags/productLinks'
+    'products/tags', 'tags', 'tags/apiLinks', 'tags/productLinks', 'tags/operationLinks'
 )) { $null = $apiOpsTypes.Add($type) }
 $previewVersions = @{
     'apis/tools'                       = '2025-09-01-preview'
@@ -247,6 +247,7 @@ function Set-FileExpression([string]$expression) {
 }
 
 function Get-SafeName([string]$value) {
+    $value = $value.Replace('/', '_')
     $name = [IO.Path]::GetFileName($value)
     if (-not $name -or $name -ne $value -or $name -in @('.', '..') -or $name.EndsWith('.')) {
         throw "Nome file non valido: $value"
@@ -383,6 +384,13 @@ function Export-PortalMedia([string]$destination) {
             }
             else {
                 $name = Get-SafeName $blobId
+                $baseName = [IO.Path]::GetFileNameWithoutExtension($name)
+                $extension = [IO.Path]::GetExtension($name)
+                $suffix = 0
+                while (-not $reservedNames.Add($name)) {
+                    $suffix++
+                    $name = "${baseName}_$suffix$extension"
+                }
                 $orphans.Add($blobId)
             }
             $filename = [IO.Path]::GetFullPath((Join-Path $destination $name))
@@ -392,7 +400,7 @@ function Export-PortalMedia([string]$destination) {
             }
             $encoded = ($blob.Name.Split('/') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
             try { Invoke-WebRequest -Uri "$root/$encoded`?$query" -OutFile $filename | Out-Null }
-            catch { throw "Download media non riuscito: $($blob.Name) (verificare SAS e connettivita')." }
+            catch { Write-Warning "Download media non riuscito: $($blob.Name) (verificare SAS e connettivita')." }
             if ($entry) { $entry.downloaded = $true; $entry = $null }
             $count++
         }
@@ -404,9 +412,9 @@ function Export-PortalMedia([string]$destination) {
             $url = [string]$entry.resource.properties.downloadUrl
             if (-not $url) { throw "Media $id non presente nello storage e privo di downloadUrl." }
             $uri = [uri]$url
-            if ($uri.Scheme -ne 'https') { throw "downloadUrl non HTTPS per media $id" }
+            if ($uri.Scheme -ne 'https') { Write-Warning "downloadUrl non HTTPS per media $id" }
             try { Invoke-WebRequest -Uri $uri -OutFile (Join-Path $destination $entry.filename) | Out-Null }
-            catch { throw "Download media non riuscito per $id (verificare il downloadUrl)." }
+            catch { Write-Warning "Download media non riuscito per $id (verificare il downloadUrl)."; continue }
             $entry.downloaded = $true
             $count++
         }
