@@ -10,13 +10,8 @@ Mantenere `Upload-PortalMedia.ps1` accanto allo script di dump: viene copiato
 nella cartella di output per rendere il risultato autonomo.
 
 ```powershell
-.\Dump-ApimArm.ps1
-# Oppure con un percorso e un'istanza differenti:
-.\Dump-ApimArm.ps1 -SubscriptionId <id> -ResourceGroupName <gruppo> -ServiceName <nome> -OutputDirectory .\dump
-# Per escludere le risorse già gestite da ApiOps:
-.\Dump-ApimArm.ps1 -SubscriptionId <id> -ResourceGroupName <gruppo> -ServiceName <nome> -OutputDirectory .\dump -NoApis
-# Per configurare un'istanza esistente senza esportare sottoscrizioni, utenti e gruppi:
-.\Dump-ApimArm.ps1 -SubscriptionId <id> -ResourceGroupName <gruppo> -ServiceName <nome> -OutputDirectory .\dump -AsExisting -NoSubscriptions -NoUsersGroups
+# Per configurare un'istanza esistente senza esportare api, sottoscrizioni, utenti e gruppi:
+.\Dump-ApimArm.ps1 -SubscriptionId <id> -ResourceGroupName <gruppo> -ServiceName <nome> -OutputDirectory .\dump -AsExisting -NoApis -NoSubscriptions -NoUsersGroups
 ```
 
 `-OutputDirectory` accetta percorsi assoluti o relativi, anche se la directory
