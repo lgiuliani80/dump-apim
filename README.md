@@ -11,7 +11,40 @@ POST `listSecrets` necessaria per ottenere l'URL temporaneo dei media.
 .\Dump-ApimArm.ps1 -SubscriptionId <id> -ResourceGroupName <gruppo> -ServiceName <nome> -OutputDirectory .\dump
 # Per escludere le risorse già gestite da ApiOps:
 .\Dump-ApimArm.ps1 -SubscriptionId <id> -ResourceGroupName <gruppo> -ServiceName <nome> -OutputDirectory .\dump -NoApis
+# Per configurare un'istanza esistente senza esportare sottoscrizioni, utenti e gruppi:
+.\Dump-ApimArm.ps1 -SubscriptionId <id> -ResourceGroupName <gruppo> -ServiceName <nome> -OutputDirectory .\dump -AsExisting -NoSubscriptions -NoUsersGroups
 ```
+
+`-OutputDirectory` accetta percorsi assoluti o relativi, anche se la directory
+non esiste ancora. I percorsi relativi sono risolti rispetto alla posizione
+PowerShell corrente (`$PWD`), non alla directory del processo (che puo' essere
+`C:\Windows\System32`). Tutti i file e le sottocartelle del dump sono creati
+sotto la directory di output risolta.
+
+Il Bicep espone `param serviceName string` con valore predefinito uguale al nome
+dell'istanza esportata. Nomi delle risorse figlie e riferimenti ARM interni
+all'istanza usano il parametro, inclusi gli ID nelle proprieta' annidate.
+Il parametro non modifica i file HTML/XML o gli URL e gli altri metadati del
+servizio sorgente, che restano uno snapshot.
+
+I flag sono combinabili:
+
+- `-NoSubscriptions` omette le sottoscrizioni APIM, incluse quelle dei workspace
+  (non si riferisce alle sottoscrizioni Azure).
+- `-NoUsersGroups` omette utenti, gruppi, appartenenze, associazioni dei prodotti
+  ai gruppi e destinatari utenti delle notifiche, anche nei workspace.
+  Non elimina eventuali riferimenti a utenti/gruppi nelle proprieta' delle
+  risorse conservate: questi devono gia' esistere nella destinazione.
+- `-AsExisting` dichiara la risorsa padre APIM come `existing`, senza `properties`,
+  SKU, identita', tag o location; le risorse figlie rimangono distribuibili.
+
+I content type standard del Developer Portal (`page`, `document`, `layout`,
+`blogpost`, `blob`, `url`, `navigation`, `block`, `popup`) e
+`portalsettings/delegation` e `portalsettings/default` sono sempre dichiarati `existing`, senza
+`properties`, come nel Bicep di riferimento. I content type personalizzati e
+i content item non diventano `existing`. Non serve il file di riferimento
+per eseguire lo script. `report.json` registra `noSubscriptions`,
+`noUsersGroups` e `asExisting`, oltre a `noApis`.
 
 `-NoApis` esclude le risorse coperte dalla tabella
 [Supported Scenarios di ApiOps](https://azure.github.io/apiops/apiops/1-supportedScenarios/):
@@ -36,7 +69,7 @@ lo script emette un warning ma **non interrompe l'esportazione**.
 e non vengono eliminati automaticamente.
 
 Il risultato e' una cartella `apim-openailg-<timestamp>` con `main.bicep`
-(sorgente Bicep senza parametri o variabili),
+(sorgente Bicep con parametro `serviceName`),
 `portal-media\` (blob binari del Developer Portal), `html\`, `policies\` e `report.json`
 (conteggi ed eventuali collection che rispondono 404). Lo script enumera le
 collection di risorse APIM annidate, incluse API, revisioni come API, operazioni,
@@ -69,3 +102,17 @@ di sola lettura. Non e' una garanzia di redeploy immediato. Controllare
 404 non e' possibile attestare che sia vuota, percio' il report non certifica
 la completezza assoluta. Non pubblicare la cartella:
 il contenuto puo' includere policy, dati degli utenti e altri valori sensibili.
+
+## Test
+
+```powershell
+.\tests\Dump-ApimArm.Tests.ps1
+```
+
+I test usano risposte ARM e storage simulate, senza autenticazione o accesso a
+risorse Azure. Richiedono PowerShell 7, Azure CLI e il compilatore Bicep gia'
+installato (`az bicep version`). Verificano i flag singolarmente e combinati,
+la compatibilita' con `-NoApis`, le dichiarazioni `existing`, i riferimenti
+parametrizzati e l'estrazione HTML/XML compilando realmente il Bicep prodotto.
+Verificano anche percorsi di output relativi e assoluti con spazi, mantenendo
+diverse la directory PowerShell e quella del processo.

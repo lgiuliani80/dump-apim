@@ -4,7 +4,7 @@
     Esporta uno snapshot Bicep di un'istanza APIM e i media del Developer Portal.
 .DESCRIPTION
     Enumera le risorse ARM APIM (incluse quelle annidate), segue nextLink e salva
-    un sorgente Bicep senza parametri o variabili. I file HTML, XML e binari
+    un sorgente Bicep con il nome APIM parametrizzato. I file HTML, XML e binari
     sono referenziati con le funzioni loadTextContent/loadFileAsBase64.
     L'output puo' contenere dati riservati. I segreti che Azure non restituisce non
     possono essere ricostruiti; il template e' uno snapshot, non una garanzia di
@@ -16,7 +16,10 @@ param(
     [string]$ResourceGroupName,
     [string]$ServiceName,
     [string]$OutputDirectory,
-    [switch]$NoApis
+    [switch]$NoApis,
+    [switch]$NoSubscriptions,
+    [switch]$NoUsersGroups,
+    [switch]$AsExisting
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,6 +108,80 @@ $readOnlyPaths = @{
     'service/workspaces/schemas' = @('properties/provisioningState')
 }
 $removedReadOnly = [ordered]@{}
+$existingNames = @{
+    'Microsoft.ApiManagement/service/contentTypes' = @(
+        'page', 'document', 'layout', 'blogpost', 'blob', 'url', 'navigation', 'block', 'popup'
+    )
+    'Microsoft.ApiManagement/service/portalsettings' = @('delegation', 'default')
+}
+
+function Test-ExistingResource([string]$type, [string]$name) {
+    if ($type -eq 'Microsoft.ApiManagement/service') { return [bool]$AsExisting }
+    return $existingNames.ContainsKey($type) -and $name.Split('/')[-1] -in $existingNames[$type]
+}
+
+function Remove-ExistingProperties {
+    foreach ($resource in $resources) {
+        if (-not (Test-ExistingResource $resource.type $resource.name)) { continue }
+        foreach ($field in @($resource.Keys)) {
+            if ($field -notin @('type', 'apiVersion', 'name')) { $resource.Remove($field) }
+        }
+    }
+}
+
+function ConvertTo-ExistingBicep([string]$source) {
+    # Il decompiler produce dichiarazioni top-level e nomi su una sola riga.
+    return [regex]::Replace($source, '(?ms)^resource (?<symbol>\w+) ''(?<type>[^''@]+)@(?<version>[^'']+)'' = \{\r?\n(?<body>.*?)^\}', {
+        param($match)
+        $body = $match.Groups['body'].Value
+        $name = [regex]::Match($body, '(?m)^  name: (?<value>[^\r\n]+)').Groups['value'].Value.Trim("'")
+        if (-not (Test-ExistingResource $match.Groups['type'].Value $name)) { return $match.Value }
+        $identity = [regex]::Matches($body, '(?m)^  (?:name|parent|scope): [^\r\n]+\r?\n')
+        if (-not $name -or -not $identity.Count) { throw "Identita Bicep non trovata: $($match.Groups['symbol'].Value)" }
+        $header = $match.Value.Substring(0, $match.Value.IndexOf('{'))
+        return $header.Replace(' = ', ' existing = ') + "{`n" + (($identity | ForEach-Object Value) -join '') + '}'
+    })
+}
+
+function ConvertTo-ParameterizedReference($node) {
+    if ($node -is [System.Collections.IDictionary]) {
+        foreach ($key in @($node.Keys)) { $node[$key] = ConvertTo-ParameterizedReference $node[$key] }
+    }
+    elseif ($node -is [pscustomobject]) {
+        foreach ($property in $node.PSObject.Properties) {
+            $property.Value = ConvertTo-ParameterizedReference $property.Value
+        }
+    }
+    elseif ($node -is [array]) {
+        for ($i = 0; $i -lt $node.Count; $i++) { $node[$i] = ConvertTo-ParameterizedReference $node[$i] }
+        return ,$node
+    }
+    elseif ($node -is [string]) {
+        $parts = [regex]::Split($node, '(?i)' + [regex]::Escape($serviceId) + '(?=/|$)')
+        if ($parts.Count -gt 1) {
+            $arguments = [System.Collections.Generic.List[string]]::new()
+            for ($i = 0; $i -lt $parts.Count; $i++) {
+                if ($i) { $arguments.Add("resourceId('Microsoft.ApiManagement/service', parameters('serviceName'))") }
+                if ($parts[$i]) { $arguments.Add("'" + $parts[$i].Replace("'", "''") + "'") }
+            }
+            if ($arguments.Count -eq 1) { return "[$($arguments[0])]" }
+            return "[concat($($arguments -join ', '))]"
+        }
+    }
+    return $node
+}
+
+function Set-ServiceNameParameter {
+    foreach ($resource in $resources) {
+        $null = ConvertTo-ParameterizedReference $resource
+        $suffix = $resource.name.Substring($ServiceName.Length).Replace("'", "''")
+        $resource.name = if ($suffix) {
+            "[concat(parameters('serviceName'), '$suffix')]"
+        } else {
+            "[parameters('serviceName')]"
+        }
+    }
+}
 
 function Remove-ReadOnlyPath($node, [string[]]$parts) {
     if ($node -is [array]) {
@@ -319,6 +396,8 @@ function Visit-Children([string]$parentPath, [string]$parentType) {
     foreach ($collection in $rules[$parentType]) {
         $typePath = if ($parentType) { "$parentType/$collection" } else { $collection }
         $collectionPath = if ($parentPath) { "$parentPath/$collection" } else { $collection }
+        if ($NoSubscriptions -and $collection -eq 'subscriptions') { continue }
+        if ($NoUsersGroups -and $collection -in @('users', 'groups', 'groupLinks', 'recipientUsers')) { continue }
         if ($NoApis -and $apiOpsTypes.Contains($typePath) -and -not $rules.ContainsKey($typePath)) { continue }
         $version = if ($previewVersions.ContainsKey($typePath)) { $previewVersions[$typePath] } else { $apiVersion }
         $items = @(Get-Collection $collectionPath $version)
@@ -454,14 +533,19 @@ try {
     $resources.Add($root)
     Visit-Children '' ''
 
-    $target = [IO.Path]::GetFullPath($OutputDirectory)
+    $target = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
     $null = New-Item -Path $target -ItemType Directory -Force
     $media = Export-PortalMedia (Join-Path $target 'portal-media')
+    Remove-ExistingProperties
     Remove-ReadOnlyProperties
     $text = Export-PolicyAndHtml $target
+    Set-ServiceNameParameter
     $template = [ordered]@{
         '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
         contentVersion = '1.0.0.0'
+        parameters     = @{
+            serviceName = @{ type = 'string'; defaultValue = $ServiceName }
+        }
         resources      = $resources.ToArray()
     }
     $intermediate = Join-Path $target '_apim-intermediate.json'
@@ -471,7 +555,7 @@ try {
         [IO.File]::WriteAllText($intermediate, (ConvertTo-Json -InputObject $template -Depth 100), [Text.UTF8Encoding]::new($false))
         & az bicep decompile --file $intermediate --force --only-show-errors
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $generated)) { throw 'Decompilazione Bicep non riuscita.' }
-        $source = [IO.File]::ReadAllText($generated)
+        $source = ConvertTo-ExistingBicep ([IO.File]::ReadAllText($generated))
         foreach ($marker in $fileExpressions.Keys) {
             $literal = "'$marker'"
             if ($source.IndexOf($literal, [StringComparison]::Ordinal) -lt 0) { throw "Riferimento Bicep non trovato: $marker" }
@@ -502,6 +586,9 @@ try {
         resourceId = $serviceId
         apiVersion = $apiVersion
         noApis = [bool]$NoApis
+        noSubscriptions = [bool]$NoSubscriptions
+        noUsersGroups = [bool]$NoUsersGroups
+        asExisting = [bool]$AsExisting
         armResourceCount = $resources.Count
         removedReadOnlyProperties = $removedReadOnly
         portalMediaCount = $media.count
